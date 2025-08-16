@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Air Draw — Dual Hands</title>
+  <style>
+    body {
+      margin: 0; background: #000; display: flex; justify-content: center;
+      align-items: center; height: 100vh; overflow: hidden;
+    }
+    video, canvas {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    #drawing { pointer-events: none; }
+    #overlay { pointer-events: none; }
+    #ui {
+      position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.5); padding: 10px 20px; border-radius: 12px;
+      color: #fff; font-family: sans-serif; display: flex; gap: 14px;
+      align-items: center; z-index: 999;
+    }
+    #ui input[type="color"] { width: 32px; height: 32px; border: none; }
+  </style>
+</head>
+<body>
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="drawing"></canvas>
+  <canvas id="overlay"></canvas>
+
+  <!-- UI panel -->
+  <div id="ui">
+    <label>Left <input type="color" id="colorL" value="#00ffff"></label>
+    <label>Right <input type="color" id="colorR" value="#ff00ff"></label>
+    <label>Brush <input type="range" id="brush" min="2" max="30" value="6"></label>
+    <button id="clear">Clear</button>
+    <button id="save">Save</button>
+    <span id="fps">-- fps</span>
+  </div>
+
+  <script type="module">
+    import {
+      FilesetResolver,
+      HandLandmarker,
+      DrawingUtils
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+    const video = document.getElementById("webcam");
+    const drawing = document.getElementById("drawing");
+    const overlay = document.getElementById("overlay");
+    const ctxDraw = drawing.getContext("2d");
+    const ctxOverlay = overlay.getContext("2d");
+
+    // === UI refs
+    const colorL = document.getElementById("colorL");
+    const colorR = document.getElementById("colorR");
+    const brush = document.getElementById("brush");
+    const clearBtn = document.getElementById("clear");
+    const saveBtn = document.getElementById("save");
+    const fpsEl = document.getElementById("fps");
+
+    let handLandmarker;
+    let lastPoints = {}; // store last point per hand
+    let strokes = [];    // stroke history for undo
+    let frames = 0, lastTime = performance.now();
+
+    async function initCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: "user" }
+      });
+      video.srcObject = stream;
+      await video.play();
+      [drawing, overlay].forEach(c => {
+        c.width = video.videoWidth;
+        c.height = video.videoHeight;
+      });
+    }
+
+    async function initModel() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+      );
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+    }
+
+    function px(lm, w, h) {
+      return { x: w - lm.x * w, y: lm.y * h };
+    }
+
+    function drawSkeleton(landmarks, utils) {
+      utils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS,
+        { color: "rgba(0,255,255,0.6)", lineWidth: 3 });
+      utils.drawLandmarks(landmarks, { color: "#ff00ff", lineWidth: 1 });
+    }
+
+    function loop() {
+      const now = performance.now();
+      const res = handLandmarker.detectForVideo(video, now);
+      ctxOverlay.clearRect(0, 0, overlay.width, overlay.height);
+
+      if (res.landmarks?.length) {
+        const utils = new DrawingUtils(ctxOverlay);
+        res.landmarks.forEach((lm, i) => {
+          // draw skeleton
+          drawSkeleton(lm, utils);
+
+          // get index tip
+          const tip = px(lm[8], drawing.width, drawing.height);
+
+          // pinch detection
+          const thumb = px(lm[4], drawing.width, drawing.height);
+          const pinching = Math.hypot(tip.x - thumb.x, tip.y - thumb.y) < 40;
+
+          if (pinching) {
+            if (!lastPoints[i]) lastPoints[i] = tip;
+            ctxDraw.strokeStyle = i === 0 ? colorL.value : colorR.value;
+            ctxDraw.lineWidth = brush.value;
+            ctxDraw.lineCap = "round";
+            ctxDraw.beginPath();
+            ctxDraw.moveTo(lastPoints[i].x, lastPoints[i].y);
+            ctxDraw.lineTo(tip.x, tip.y);
+            ctxDraw.stroke();
+
+            // save stroke segment
+            strokes.push({
+              hand: i, from: { ...lastPoints[i] }, to: { ...tip },
+              color: ctxDraw.strokeStyle, size: ctxDraw.lineWidth
+            });
+
+            lastPoints[i] = tip;
+          } else {
+            lastPoints[i] = null;
+          }
+        });
+      } else {
+        lastPoints = {}; // reset if no hands
+      }
+
+      // fps
+      frames++;
+      if (now - lastTime > 1000) {
+        fpsEl.textContent = `${frames} fps`;
+        frames=0; lastTime=now;
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    // === Extra features
+    clearBtn.onclick = () => {
+      strokes = [];
+      ctxDraw.clearRect(0,0,drawing.width,drawing.height);
+    };
+
+    saveBtn.onclick = () => {
+      const a = document.createElement("a");
+      a.download = "air-draw.png";
+      a.href = drawing.toDataURL("image/png");
+      a.click();
+    };
+
+    window.addEventListener("keydown", e => {
+      if (e.key==="z") { // undo
+        strokes.pop();
+        ctxDraw.clearRect(0,0,drawing.width,drawing.height);
+        strokes.forEach(s => {
+          ctxDraw.strokeStyle = s.color;
+          ctxDraw.lineWidth = s.size;
+          ctxDraw.beginPath();
+          ctxDraw.moveTo(s.from.x, s.from.y);
+          ctxDraw.lineTo(s.to.x, s.to.y);
+          ctxDraw.stroke();
+        });
+      }
+    });
+
+    (async () => {
+      await initCamera();
+      await initModel();
+      requestAnimationFrame(loop);
+    })();
+  </script>
+</body>
+</html>
